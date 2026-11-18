@@ -24,6 +24,7 @@ transforms, but must not override capture ordering, packet selection, clock
 provenance, or timing validation. `clock`/`snapshot_provider` injection and
 `require_camera_timing=False` are simulated-test facilities only.
 
+
 Missing/stale/skewed frames fail closed. Missing referenced frames in the raw
 video invalidate export; retain raw data for diagnosis, never silently repair
 the pairing. See `docs/recording_timestamps.md` and run
