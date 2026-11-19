@@ -1,0 +1,4 @@
+# Offline audit only. No torch, CUDA, ROS, or LeRobot dependency.
+numpy
+pyarrow
+Pillow
