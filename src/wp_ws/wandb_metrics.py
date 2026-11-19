@@ -84,6 +84,11 @@ def scalar_configuration(source, task, run_name):
     for key in ("batch_size", "seed", "steps_requested", "gradient_clip_max_norm"):
         if key in manifest:
             result[key] = manifest[key]
+    sampling = manifest.get("sampler_configuration", {})
+    result["sampling"] = {key: sampling[key] for key in ("mode", "window_episodes", "epoch0_batches") if key in sampling}
+    probe = manifest.get("train_probe_selection") or {}
+    result["train_probe"] = {key: probe[key] for key in ("sample_count", "samples_per_episode", "evaluation_scope")
+                             if key in probe}
     # Do not upload cli_arguments, provenance/paths, statistics, environment or arbitrary keys.
     policy = manifest.get("policy_config", {})
     result["policy"] = {key: policy[key] for key in (
@@ -147,19 +152,27 @@ def _number(value, name):
 
 def metric_values(record):
     event = record.get("event")
-    if event not in ("model_ready", "train", "validation", "completed"):
+    if event not in ("model_ready", "train", "train_probe", "validation", "completed"):
         return None
     step = 0 if event == "model_ready" else record.get("steps" if event == "completed" else "step")
     if type(step) is not int or step < 0:
         raise ValueError(f"Invalid training step for {event}: {step!r}")
     values = {"global_step": step}
-    if event in ("train", "validation"):
-        prefix = "train" if event == "train" else "val"
+    if event in ("train", "train_probe", "validation"):
+        prefix = "val" if event == "validation" else event
         values[f"{prefix}/normalized_l1"] = _number(record.get("normalized_l1"), "normalized_l1")
     mappings = {
         "train": {"gradient_norm_before_clip": "train/gradient_norm_before_clip",
-                  "batch_size_actual": "train/batch_size_actual", "epoch_zero_based": "train/epoch_zero_based"},
-        "validation": {"samples": "val/samples", "valid_action_elements": "val/valid_action_elements"},
+                  "batch_size_actual": "train/batch_size_actual", "epoch_zero_based": "train/epoch_zero_based",
+                  "window_normalized_l1": "train/window_normalized_l1",
+                  "window_valid_action_elements": "train/window_valid_action_elements",
+                  "batch_episode_count": "train/batch_episode_count", "samples_seen": "train/samples_seen"},
+        "train_probe": {"samples": "train_probe/samples", "valid_action_elements": "train_probe/valid_action_elements",
+                        "mean_constant_normalized_l1": "train_probe/mean_constant_normalized_l1",
+                        "joint_mae_rad": "train_probe/joint_mae_rad",
+                        "gripper_mae_normalized_units": "train_probe/gripper_mae_normalized_units"},
+        "validation": {"samples": "val/samples", "valid_action_elements": "val/valid_action_elements",
+                       "mean_constant_normalized_l1": "val/mean_constant_normalized_l1"},
         "model_ready": {"trainable_parameters": "model/trainable_parameters"},
     }
     for source_key, target in mappings.get(event, {}).items():
@@ -231,7 +244,7 @@ def _upload(args, source, config, directory, backend, sleep):
     last_step = -1
     try:
         run.define_metric("global_step")
-        for prefix in ("train", "val", "cuda", "timing", "model"):
+        for prefix in ("train", "train_probe", "val", "cuda", "timing", "model"):
             run.define_metric(f"{prefix}/*", step_metric="global_step")
         run.define_metric("val/normalized_l1", step_metric="global_step", summary="min")
         run.summary["source_status"] = "following" if args.follow else "snapshot_import"

@@ -99,6 +99,20 @@ class WandbMetricsTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 metrics.metric_values({"event": "train", "step": step, "normalized_l1": .5})
 
+    def test_training_probe_is_never_uploaded_as_validation(self):
+        values = metrics.metric_values({"event": "train_probe", "step": 0, "normalized_l1": .3,
+                                        "mean_constant_normalized_l1": .9, "joint_mae_rad": .01,
+                                        "per_dimension": [{"secret": "not uploaded"}], "images": "not uploaded"})
+        self.assertEqual(values, {"global_step": 0, "train_probe/normalized_l1": .3,
+                                  "train_probe/mean_constant_normalized_l1": .9, "train_probe/joint_mae_rad": .01})
+        values = metrics.metric_values({"event": "validation", "step": 0, "normalized_l1": .8,
+                                        "mean_constant_normalized_l1": .84})
+        self.assertEqual(values["val/mean_constant_normalized_l1"], .84)
+        values = metrics.metric_values({"event": "train", "step": 10, "normalized_l1": .5,
+                                        "window_normalized_l1": .6, "batch_episode_count": 6, "samples_seen": 160})
+        self.assertEqual(values["train/window_normalized_l1"], .6)
+        self.assertEqual(values["train/batch_episode_count"], 6)
+
     def test_configuration_is_allowlisted(self):
         result = metrics.scalar_configuration(self.source, "flip_the_pillow", "synthetic")
         serialized = json.dumps(result)

@@ -89,6 +89,15 @@ class ViewLossTests(unittest.TestCase):
         text = self.run_viewer('--list')
         self.assertIn('synthetic  requested=30000  latest_train_step=10', text)
 
+    def test_training_probe_labeled_separately_not_selected_as_best_val(self):
+        self.write(self.train, {"event": "train_probe", "step": 10, "normalized_l1": .05,
+                                "samples": 182, "mode": "fixed_training_probe",
+                                "mean_constant_normalized_l1": .9}, self.val)
+        text = self.run_viewer('--run-name', 'synthetic')
+        self.assertIn('train probe (NOT held out)', text)
+        self.assertIn('best val: step=10 normalized_l1=0.800000', text)
+        self.assertIn('mean_constant=0.900000', text)
+
     def test_list_excludes_preflight(self):
         self.manifest.pop('steps_requested')
         (self.source / 'run_config.json').write_text(json.dumps(self.manifest))

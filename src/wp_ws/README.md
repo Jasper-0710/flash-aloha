@@ -1,6 +1,7 @@
 # 翻转枕头：离线数据体检与固定划分
 
-本目录只做**训练前的只读检查**，不启动机器人、回放、采集或训练。
+本目录提供**只读数据体检、显式启动的离线 ACT 训练及固定小样本诊断**。
+体检/preflight 不训练；任何入口都不启动机器人、回放或采集。
 
 - 对象：当前 `data/flip_the_pillow` 中的 **LeRobot v2.1、嵌入式 RGB 图片、14 维 state/action**。
 - 原始 Parquet、图片、动作、状态、时间戳、任务元数据均不改写。
@@ -543,3 +544,273 @@ tail -n 20 -f "$METRICS"
 
 这会显示 JSONL 原始记录；Ctrl+C 只结束 `tail`。W&B 网络恢复后，仍可从同一训练日志
 补传曲线，无需重新训练。
+
+## 12. 训练不稳定时：固定 32 个训练样本的可拟合性诊断
+
+目的不是继续跑 100K，也不是把 train loss 改个名字当 val loss，而是先回答：
+**在原数据加载/图像处理/原生 ACT 优化链路下，模型能否反复拟合一组固定输入？**
+入口为 `src.wp_ws.overfit_act`，启动脚本为
+`scripts/wp_ws/overfit_flip_the_pillow_act.sh`。训练仍由使用者执行。
+
+### 实验控制与边界
+
+- 默认取固定 train split 中排序最靠前的 **2 条 episode，各 16 个等距起始帧**，
+  共 32 个输入；保存精确 episode/frame/flat index、有效 chunk 长度和缓存摘要。
+  起始帧包含 episode 首尾；每个起点的最多 50 条未来标签可能与其他起点重叠。
+  **不是 32 条独立轨迹，也不是 32 个单步标签。**
+- 支持 `--episodes 0 1` 和 `--samples-per-episode 16` 显式指定；
+  必须全部属于原训练 split。拒绝验证 episode、重复 ID 和不足数量的 episode，
+  不通过复制样本凑数；不改写固定划分。
+- 标准化仍由**原全部训练 episode**拟合，与完整训练保持相同口径，验证集不参与。
+  不从 audit 的全数据摘要取统计量，也不改成小样本统计量。
+- **复用现有 ActDataset** 的原始行配对、连续性边界、chunk/padding，以及
+  `standard_image_processing`，没有第二套图像变换。夹爪超参考范围标签照常保留。
+- **从新模型 + ImageNet 骨干初始化，不读取/续训旧 checkpoint**；模型、原生优化器、
+  学习率、dropout、梯度裁剪保持原 baseline 默认设置。batch 仍为 16。
+  只在这 32 个固定起点中跨 episode 混洗，不用旧完整训练的逐 episode 批采样。
+  因此这是可拟合性诊断，**不是仅改变一个因素的全数据 sampler 消融**。
+- 固定样本只解码一次并缓存于 CPU，默认图像缓存约 85 MiB；缓存上限默认 512 MiB。
+  上限只针对解码后的数组，不包括临时 Parquet/Arrow 压缩 episode 或整个进程内存。
+  原训练数据和审计仍要核验 SHA-256，准备阶段并非只读 32 行。
+- step 0 和每 100 步在 `eval()` + `inference_mode()` 下重测**同一训练小样本**。
+  训练阶段保持原 dropout；单个训练 batch 的 loss 与这里的全子集 eval 不应直接等同。
+  聚合按有效 action 元素加权，padding 不计入。
+- 不评估独立验证 episode、不连接硬件、不证明图像/动作同步正确、不测任务成功率。
+  诊断 checkpoint 显式标注不可直接部署，无断点恢复入口。
+
+### 本机运行
+
+```bash
+conda activate flash-aloha-act
+cd /home/ubuntu/Desktop/code/VLA/flash-aloha
+
+# 可选：只显示命令；不接触 CUDA、不下载、不写文件。
+bash scripts/wp_ws/overfit_flip_the_pillow_act.sh train --dry-run
+
+# 可选：CPU 核验及缓存测试；不构建/训练模型。
+bash scripts/wp_ws/overfit_flip_the_pillow_act.sh preflight
+
+# 实际小样本实验：1500 次更新，batch 16，仍为 chunk 50 / 240x320。
+GPU_ID=0 bash scripts/wp_ws/overfit_flip_the_pillow_act.sh train
+```
+
+`train` 会自行执行 preflight，不要求先运行上面的独立 preflight。
+所有同名 run 拒绝覆盖；第二次实验用 `--run-name act_overfit_32_local_v2`。
+脚本不会安装依赖或自动登录/上传 W&B；缺少 ImageNet 权重缓存时，训练入口会由
+原生 torchvision 下载，失败不会自动退化成 scratch。
+
+直接 Python 命令等价为：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m src.wp_ws.overfit_act train \
+  --run-name act_overfit_32_local_v1 \
+  --samples-per-episode 16 --batch-size 16 \
+  --steps 1500 --eval-every 100 --log-every 50 \
+  --chunk-size 50 --height 240 --width 320 \
+  --backbone-init imagenet --acknowledge-audit-warnings
+```
+
+服务器使用相同代码/数据/审计，在服务器的 Conda 环境和项目根目录执行：
+
+```bash
+GPU_ID=1 bash scripts/wp_ws/overfit_flip_the_pillow_act.sh train \
+  --run-name act_overfit_32_gpu1_v1
+```
+
+单 GPU 足够做此诊断；当前入口不是 DDP，不要传 `GPU_ID=1,2,3`。
+先不增大 batch、改图像尺寸或 chunk，避免在诊断时引入更多变化。
+
+### 看什么结果
+
+终端每次评估显示：
+
+```text
+[同训练样本 eval] step=... L1=... mean基线=... median基线=...
+```
+
+两个常数基线都在**同一组已选样本、相同标签权重**上计算：
+
+1. `train_mean_constant`：始终预测原训练集动作均值，即标准化后的零向量。
+2. `subset_median_constant`：把所选样本中的有效 chunk 标签汇总，拟合每维单一中位数；
+   它是在这组目标上 L1 最优的单常数动作向量，不读取图像/state，不按 horizon 单独拟合。
+   它比“零向量”更能排除模型只是拟合了这几条 episode 的常见姿态。
+
+**不能拿之前全验证集上的 0.84279 均值基线直接作为这里的阈值**，样本集合不同。
+判断同样本 eval 相比 step 0 是否持续、明显下降，以及是否明显优于这两个常数。
+没有适用于所有动作的“loss < 某数就能部署”的阈值。
+
+| 观测 | 能说明什么 / 下一步 |
+|---|---|
+| 同样本 eval 明显下降，并优于两个常数 | 这组样本的拟合链路基本可用；再做跨 episode 的全数据采样对照，用原固定验证集选择模型。不能证明相机同步、视觉依赖或任务成功。 |
+| train batch loss 波动，但同样本 eval 明显下降 | 不要只盯训练的单 batch 点；继续看固定 eval 和逐维误差。 |
+| 1500 步后同样本 eval 仍接近初始值/常数 | 先缩到 1 个输入验证优化链路，再分别检查输入、梯度更新和学习率等；不要直接开另一个 100K。不能仅据此断言数据错误。 |
+| 关节误差下降但某侧夹爪/horizon 很差 | 先看逐维、逐 episode、逐 horizon 指标与原动作；不自动裁剪、平移动作或重配图像。 |
+
+若需要进一步缩成一个固定输入（episode ID 应从 `selection.json` 选一个训练 ID）：
+
+```bash
+# 例：确认 episode 0 属于训练 split 后才使用 0。
+GPU_ID=0 bash scripts/wp_ws/overfit_flip_the_pillow_act.sh train \
+  --run-name act_overfit_one_sample_v1 --episodes 0 \
+  --samples-per-episode 1 --batch-size 1 --steps 500 --eval-every 50
+```
+
+这只能测试一个输入的拟合，不构成完整数据修复或泛化结论。
+
+### 输出与回传
+
+通过中央 `src/config/paths.py` 写入：
+
+```text
+LOG_DIR/wp_ws/flip_the_pillow/<run-name>/
+  selection.json            精确固定样本与缓存摘要
+  normalization_stats.json  原训练 split 的统计量
+  baselines.json            两个常数的同样本误差
+  metrics.jsonl             overfit_train / overfit_eval；含逐维/episode/horizon 指标
+  report.md                 每次评估后更新的简明表格
+  run_config.json           配置、来源、实现摘要、评估边界
+  COMPLETED.json            正常跑完后的摘要（中断/异常则 FAILED.json）
+CKPT_DIR/wp_ws/flip_the_pillow/<run-name>/
+  best.ckpt                 以同训练样本 eval 选择，可能是 step 0；不是验证集最佳
+  last.ckpt                 最近评估点；含模型/统计/配置，不含优化器，不支持 resume
+```
+
+可将 `report.md` 和 `COMPLETED.json` 发回来；中断时发送已有 `report.md` / `FAILED.json`。
+`COMPLETED` 只表示指定步数执行完，不是“已收敛”或机器人任务通过。
+如覆盖了中央日志根目录，下面的读法仍适用：
+
+```bash
+python - <<'PY'
+from src.config.paths import LOG_DIR
+p = LOG_DIR / 'wp_ws' / 'flip_the_pillow' / 'act_overfit_32_local_v1'
+print((p / 'report.md').read_text())
+if (p / 'COMPLETED.json').exists():
+    print((p / 'COMPLETED.json').read_text())
+PY
+```
+
+**现有 `wandb_metrics` / `view_loss` 只支持常规 ACT 训练格式，本诊断未接入它们。**
+不要改事件名冒充验证 loss；本轮先用终端、Markdown 表格和 JSON 指标判断。
+合成 CPU 测试（需 ACT 环境的 torch，但不会启动 GPU 训练）：
+
+```bash
+python -m unittest src.wp_ws.tests.test_overfit_act -v
+```
+
+## 13. 小样本拟合通过后：全数据采样对照（先 10K，不增大 batch）
+
+这个实验检验的是**采样顺序是否影响拟合/泛化**，不是预先认定旧 sampler 是根因。
+32 个训练输入过拟合成功，不能把该组的 ~0.05 和 5823 个独立验证起点的 loss 直接比较。
+先保持原模型、ImageNet 初始化、优化器/LR、batch 16、chunk 50、240×320、seed 42、
+原 train/val split、原始夹爪标签和共享图像处理不变。两种模式都是**新初始化**，不续训旧 checkpoint。
+
+### 单一对照变量与缓存边界
+
+- `episode_block`：原来的按 episode 连续取 batch，CLI **默认仍保留这个行为**。
+- `episode_window`：每个 epoch 打乱训练 episode，分成最多 8 个的窗口，在每个窗口内打乱所有起点，
+  一个 batch 可以来自多个 episode。**不是全数据全局均匀乱序，也不保证每个 batch 都跨 episode**。
+  每个 epoch 每个训练行恰好一次，不重复、不丢弃；窗口尾 batch 保留，batch 不跨窗口。
+  每个样本内部的 action chunk、边界和 padding 完全沿用 `ActDataset.__getitem__`，绝不跨 episode 拼 action。
+- 混采仅支持 `--workers 0`。采样器在读取该窗口的 batch 前声明窗口；窗口内每张 Arrow 表只加载一次，
+  切换窗口释放旧表。**缓存的仍是含原始压缩图片字节的 Arrow 表，不是整套解码图像**。
+- `--episode-cache-mib 1024` 限制当前窗口**保留的 Arrow buffer 总量**；超过会报错，
+  不自动缩窗口或退化成频繁重读。此限额**不包括临时读取/解压、Python/Arrow 对象、验证单 episode、
+  batch 张量、pinned memory、模型内存**，不是进程 RSS 或显存上限。
+- 旧模式每个 episode 一个尾 batch，新模式每个窗口一个尾 batch，因此相同 step 的累计样本数可能略不同；
+  日志记录 `samples_seen`、`batch_size_actual` 和 `batch_episode_count`，比较时应核对。
+  固定 seed 不承诺 CUDA 逐位复现；单次对照也不足以证明因果。
+
+### 固定评估，不再只盯单个 train batch
+
+新启动脚本默认加上：
+
+1. `--train-probe-per-episode 2`：每个训练 episode 在约 25% / 75% 的行位置各取一个原始输入，
+   当前 91 个训练 episode 共 **182 个输入**，每次评估完全相同。保存精确行号与数组 SHA-256，
+   只经现有适配器解码一次；默认 `--train-probe-cache-mib 512`，当前分辨率约 480.4 MiB 的 CPU 数组。
+   这不是额外训练集/验证集，也没有改变训练起点的权重；它只是已参与训练的数据的固定测量点。
+   每个 episode 同样选 2 点，所以**不等同于全训练集逐行 loss**。
+2. `--eval-at-start`：更新前 step 0 评估；然后每 1000 步评估，最多先做 10000 步。
+3. `--val-max-batches 0`：原 split 的 **全部 5823 个验证起点**，不抽 smoke subset、不重新划分。
+   原模型 masked L1 按有效 action 元素累计；验证集不拟合任何标准化参数/参考向量。
+4. 均值动作基线：始终预测训练集 mean（标准化后零向量），分别在 probe/验证的
+   **同一批标签和 padding** 上计算。验证的参考向量不是在验证集上拟合的。
+   probe 文件还保留该训练探针的单向量中位数基线，但不把它冒充验证成绩。
+5. `best.ckpt` **只按验证 L1** 选，不按 train/probe 选；可能保留 step 0 的权重。
+   `last.ckpt` 每 1000 步保存，仍无 resume 入口、仍不是可直接部署的模型。
+
+### 用户执行
+
+```bash
+conda activate flash-aloha-act
+cd /home/ubuntu/Desktop/code/VLA/flash-aloha
+
+# 仅打印命令：不启动 Python/CUDA，不生成文件
+bash scripts/wp_ws/compare_sampling_flip_the_pillow_act.sh mixed --dry-run
+
+# 可选：先只做 CPU 预检，检查指纹/标准化/混合 batch/固定探针
+bash scripts/wp_ws/compare_sampling_flip_the_pillow_act.sh preflight
+
+# 建议先跑混采 10K，保持 bs16（会自动重复预检）
+GPU_ID=0 bash scripts/wp_ws/compare_sampling_flip_the_pillow_act.sh mixed
+```
+
+独立日志/ckpt 名分别为 `act_mix8_preflight_v1` 和 `act_mix8_b16_10k_v1`；已存在会拒绝覆盖。
+重试时显式给新的 `--run-name`。服务器复制本次代码后：激活服务器的 `flash-aloha`，
+进入 `/data1/wp_ws/flash-aloha`，使用 `GPU_ID=1`（或另一张获准的单卡）。
+RTX 6000 PRO 的显存更大不意味着本次要改 batch；这个入口也不是 6 卡 DDP。
+
+需要严格的新对照时单独执行（不要由同一张卡并发两项）：
+
+```bash
+GPU_ID=0 bash scripts/wp_ws/compare_sampling_flip_the_pillow_act.sh control
+```
+
+对照 run 为 `act_block_b16_10k_v1`。两个 launcher 配置只在 sampler/run-name 上不同；
+旧 100K 实验的 5K/10K 验证点可参考，但缺失相同的固定 probe 和 step-0 指标，不能代替完整对照。
+不要为了等 10K 结束而忽略已经出现的异常；OOM/非有限 loss/缓存超限应停下看错误，勿直接重开 100K。
+
+### 看 loss 与回传
+
+```bash
+# 不依赖 W&B 网络，包含训练探针和验证；添加 --plot 可导出本地 PNG
+python -m src.wp_ws.view_loss --run-name act_mix8_b16_10k_v1 --follow
+
+# 另一终端；仅上传白名单标量，不上传图片/动作/模型。403 不影响训练，用上面的本地入口即可。
+python -m src.wp_ws.wandb_metrics \
+  --run-name act_mix8_b16_10k_v1 --project flash-aloha --mode online --follow
+```
+
+重点曲线：
+
+| 指标 | 含义 |
+|---|---|
+| `train/normalized_l1` | 原日志：某一次训练 batch 的 L1，含训练时 dropout，不同点的输入不同 |
+| `train/window_normalized_l1` | 从上次日志到本次日志的有效元素加权平均；跨更新的描述量，不是同一权重的固定集评估 |
+| `train_probe/normalized_l1` | 固定 182 个训练输入，eval/no-grad 下测量拟合趋势，**不是 held-out validation** |
+| `val/normalized_l1` | 固定完整验证集，才用它选择 best checkpoint |
+| `val/mean_constant_normalized_l1` | 同一验证集的均值动作参考线；持续、明显优于它比只看训练 loss 更有意义 |
+| `train/batch_episode_count` | 当前 batch 里有几个 episode，检查混采是否真的生效 |
+
+新训练在每次评估后更新：
+
+```text
+LOG_DIR/wp_ws/flip_the_pillow/act_mix8_b16_10k_v1/
+  report.md                     step / 固定 train probe / 完整验证 / 各自均值参考线
+  train_probe_selection.json    精确训练起点、缓存数组摘要与选择算法
+  train_probe_baselines.json    probe 的两个同样本常数参考
+  metrics.jsonl                 train / train_probe / validation，probe 含逐维/episode/horizon 误差
+  run_config.json               混采/缓存/评估配置及来源
+  COMPLETED.json / FAILED.json  运行状态（不是任务成功/失败的评估）
+```
+
+跑到 3K–5K 可以先看趋势，不用等 10K 才回传 `report.md`；保留最后的 `COMPLETED.json`/`FAILED.json`。
+训练 probe 降、验证降且持续优于常数，才考虑延长；probe 降而验证停滞/变差，要研究泛化差距；
+两者都不降，进一步排查而非只增加 step 或 batch。10K 仅是第一轮诊断预算，不是必然收敛的期限。
+这些都是离线信号，不证明视觉依赖、采集曝光同步、真机动作成功或硬件安全。
+
+合成 CPU 测试与脚本语法检查（不启动真实训练/机器人）：
+
+```bash
+python -m unittest discover -s src/wp_ws/tests -v
+bash -n scripts/wp_ws/compare_sampling_flip_the_pillow_act.sh
+```

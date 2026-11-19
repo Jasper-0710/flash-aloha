@@ -57,6 +57,15 @@ def build_parser():
         sub.add_argument("--seed", type=_nonnegative, default=42)
         sub.add_argument("--val-max-batches", type=_nonnegative, default=10,
                          help="0: full fixed validation; >0: deterministic evenly spaced SMOKE subset")
+        sub.add_argument("--sampler", choices=("episode_block", "episode_window"), default="episode_block",
+                         help="Keep original episode blocks, or mix rows within shuffled episode windows")
+        sub.add_argument("--mix-episodes", type=_positive, default=8)
+        sub.add_argument("--episode-cache-mib", type=_positive, default=1024,
+                         help="Window mode retained Arrow buffer cap; not total RSS or transient read memory")
+        sub.add_argument("--train-probe-per-episode", type=_nonnegative, default=0,
+                         help="0 disables; otherwise fixed midpoint-stratified TRAIN starts per episode")
+        sub.add_argument("--train-probe-cache-mib", type=_positive, default=512)
+        sub.add_argument("--eval-at-start", action="store_true", help="Evaluate step 0, before any update")
         if command == "train":
             sub.add_argument("--steps", type=_positive, default=100)
             sub.add_argument("--validate-every", type=_positive, default=50)
@@ -160,6 +169,8 @@ def prepare(args, config, logs):
         ActDataset, EpisodeBatchSampler, fit_training_statistics, image_configuration, validation_batches,
     )
     from src.wp_ws.verified_data import load_verified_data
+    if args.sampler == "episode_window" and (getattr(args, "workers", 0) != 0 or args.mix_episodes < 2):
+        raise ValueError("episode_window requires --workers 0 and --mix-episodes >= 2")
     print("[1/3] 核验 audit_v1（以配置为准）与当前源文件 SHA-256；不改源数据", flush=True)
     data = load_verified_data(config, progress=lambda text: print(text, flush=True))
     if args.command == "train" and data.warnings and not args.acknowledge_audit_warnings:
@@ -168,19 +179,37 @@ def prepare(args, config, logs):
     print("[2/3] 只拟合训练 episode 的 state/action 标准化；验证集不参与", flush=True)
     statistics = fit_training_statistics(data, progress=lambda text: print(text, flush=True))
     policy_config = policy_configuration(args)
-    train = ActDataset(data, statistics, policy_config, partition="train")
+    from src.wp_ws.mixed_sampling import WindowCachedActDataset, WindowBatchSampler
+    if args.sampler == "episode_window":
+        train = WindowCachedActDataset(data, statistics, policy_config,
+                                       window_episodes=args.mix_episodes, cache_mib=args.episode_cache_mib)
+        train_sampler = WindowBatchSampler(train, args.batch_size, seed=args.seed)
+    else:
+        train = ActDataset(data, statistics, policy_config, partition="train")
+        train_sampler = EpisodeBatchSampler(train, args.batch_size, shuffle=True, seed=args.seed)
     val = ActDataset(data, statistics, policy_config, partition="val")
-    train_sampler = EpisodeBatchSampler(train, args.batch_size, shuffle=True, seed=args.seed)
     val_sampler, val_selection = validation_batches(val, args.batch_size, args.val_max_batches)
     print("[3/3] 解码训练/验证 CPU batch，调用共享 Standard ACT/Flow 图像处理", flush=True)
     batches = {"train": _batch_summary(train, next(iter(train_sampler))),
                "val": _batch_summary(val, next(iter(val_sampler)))}
+    train.clear_cache()
+    val.clear_cache()
+    probe = probe_selection = probe_baselines = None
+    if args.train_probe_per_episode:
+        from src.wp_ws.training_probe import prepare_probe
+        print("[固定训练探针] 每个训练 episode 分层选点；不读验证集拟合、不改变训练采样", flush=True)
+        probe_dataset = ActDataset(data, statistics, policy_config, partition="train")
+        probe, probe_selection, probe_baselines = prepare_probe(
+            probe_dataset, args.train_probe_per_episode, args.train_probe_cache_mib)
     source_files = {
         "native_act": Path(__file__).resolve().parents[1] / "policy/act.py",
         "native_optimizer": Path(__file__).resolve().parents[1] / "policy/mixed_precision.py",
         "shared_images": Path(__file__).resolve().parents[1] / "contracts/standard_image_processing.py",
         "adapter": Path(__file__).with_name("act_dataset.py"),
         "verifier": Path(__file__).with_name("verified_data.py"), "trainer": Path(__file__),
+        "mixed_sampling": Path(__file__).with_name("mixed_sampling.py"),
+        "training_probe": Path(__file__).with_name("training_probe.py"),
+        "diagnostic_helpers": Path(__file__).with_name("overfit_act.py"),
     }
     manifest = {
         "schema_version": 1, "format": "wp_ws.act_baseline.v1",
@@ -189,7 +218,17 @@ def prepare(args, config, logs):
         "image_preprocessing": image_configuration(policy_config, data),
         "provenance": data.provenance(), "validation_selection": val_selection,
         "normalization_file": "normalization_stats.json",
-        "sampling": "episode-block shuffle, then row shuffle; every row once per epoch; no drop_last",
+        "sampling": ("episode-block shuffle, then row shuffle; every row once per epoch; no drop_last"
+                     if args.sampler == "episode_block" else
+                     "shuffled episode windows, then mixed row shuffle within each; every row once per epoch; no drop_last"),
+        "sampler_configuration": {"mode": args.sampler,
+                                  "window_episodes": args.mix_episodes if args.sampler == "episode_window" else 1,
+                                  "retained_arrow_cache_limit_mib": args.episode_cache_mib if args.sampler == "episode_window" else None,
+                                  "epoch0_batches": len(train_sampler), "global_uniform_shuffle": False},
+        "train_probe_selection": probe_selection,
+        "train_probe_baselines": probe_baselines,
+        "evaluation_at_step_zero": args.eval_at_start,
+        "initialization": "fresh native model, NOT resumed from any previous run",
         "steps_requested": getattr(args, "steps", 0), "batch_size": args.batch_size, "seed": args.seed,
         "cli_arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "gradient_clip_max_norm": 1.0, "compile": False, "channels_last": True,
@@ -203,17 +242,22 @@ def prepare(args, config, logs):
         write_json(logs / name, data.documents[name])
     write_json(logs / "normalization_stats.json", statistics)
     write_json(logs / "run_config.json", manifest)
+    if probe_selection:
+        write_json(logs / "train_probe_selection.json", probe_selection)
+        write_json(logs / "train_probe_baselines.json", probe_baselines)
     preflight = {"status": "PREFLIGHT_PASSED", "source_content_hashes_verified": True,
                  "gpu_training_verified": False, "train_rows": len(train), "val_rows": len(val),
                  "train_episodes": len(train.episode_ids), "val_episodes": len(val.episode_ids),
                  "batches": batches, "warnings": data.warnings,
+                 "sampler": manifest["sampler_configuration"],
+                 "train_probe_samples": len(probe) if probe is not None else 0,
                  "validation_mode": val_selection["mode"], "source_metadata_changed": False}
     write_json(logs / "preflight.json", preflight)
     print(json.dumps(preflight, ensure_ascii=False, indent=2), flush=True)
     # CPU preflight may have sampled several validation episodes. Do not retain that cache.
     train.clear_cache()
     val.clear_cache()
-    return data, statistics, manifest, train, val, train_sampler, val_sampler
+    return data, statistics, manifest, train, val, train_sampler, val_sampler, probe
 
 
 def _worker_init(worker_id):
@@ -265,7 +309,8 @@ def run_training(args, prepared, checkpoints, logs):
     import torch
     from torch.utils.data import DataLoader
 
-    data, statistics, manifest, train, val, train_sampler, val_sampler = prepared
+    data, statistics, manifest, train, val, train_sampler, val_sampler, probe = prepared
+    from src.wp_ws.training_probe import evaluate_probe, evaluate_validation, write_report
     if not torch.cuda.is_available():
         raise ValueError("Native ACT training requires a CUDA GPU; preflight can run without one")
     if not torch.cuda.is_bf16_supported():
@@ -298,6 +343,8 @@ def run_training(args, prepared, checkpoints, logs):
     policy.to("cuda").train()
     policy.model.use_channels_last()
     optimizer = policy.configure_optimizers()  # Native bf16 model + fp32 master weights/moments.
+    if args.sampler == "episode_window":
+        train.table_reads = train.peak_cache_bytes = 0  # exclude CPU preflight reads from runtime telemetry
     generator = torch.Generator().manual_seed(args.seed)
     kwargs = {"num_workers": args.workers, "pin_memory": True, "generator": generator}
     if args.workers:
@@ -312,30 +359,18 @@ def run_training(args, prepared, checkpoints, logs):
     started = time.monotonic()
     best = math.inf
     last_validation = None
+    history = []
+    samples_seen = interval_elements = 0
+    interval_loss_sum = 0.0
 
     def transfer(batch):
         return tuple(batch[key].to("cuda", non_blocking=True) for key in ("qpos", "images", "actions", "is_pad"))
 
     def validate(step):
-        policy.eval()
-        numerator = denominator = samples = 0
         try:
-            with torch.inference_mode():
-                for batch in val_loader:
-                    qpos, images, actions, is_pad = transfer(batch)
-                    loss = policy(qpos, images, actions, is_pad)["loss"]
-                    if not torch.isfinite(loss).item():
-                        raise ValueError("Validation loss is nonfinite")
-                    valid_elements = int((~is_pad).sum().item()) * actions.shape[-1]
-                    numerator += loss.item() * valid_elements
-                    denominator += valid_elements
-                    samples += len(qpos)
-            if not denominator:
-                raise ValueError("Empty validation target set")
-            return {"step": step, "normalized_l1": numerator / denominator, "samples": samples,
-                    "valid_action_elements": denominator, "mode": manifest["validation_selection"]["mode"]}
+            return evaluate_validation(policy, val_loader, device="cuda", step=step,
+                                       mode=manifest["validation_selection"]["mode"])
         finally:
-            policy.train()
             val.clear_cache()
 
     with log_path.open("x", encoding="utf-8") as log:
@@ -344,9 +379,31 @@ def run_training(args, prepared, checkpoints, logs):
             print(line, flush=True)
             log.write(line + "\n")
             log.flush()
+
+        def evaluate(step):
+            nonlocal best, last_validation
+            print(f"[离线评估] step={step}；固定训练探针={len(probe) if probe is not None else 0}；"
+                  f"验证={manifest['validation_selection']['mode']}（不执行机器人）", flush=True)
+            probe_result = None
+            if probe is not None:
+                baseline = manifest["train_probe_baselines"]["train_mean_constant"]["normalized_l1"]
+                probe_result = {"step": step, **evaluate_probe(
+                    policy, probe, statistics["action"]["std"], args.batch_size, "cuda", baseline)}
+                emit({"event": "train_probe", **probe_result})
+            last_validation = validate(step)
+            emit({"event": "validation", **last_validation, "cuda_memory": _cuda_memory(torch)})
+            if last_validation["normalized_l1"] < best:
+                best = last_validation["normalized_l1"]
+                _save_checkpoint(checkpoints / "best.ckpt", policy, optimizer, statistics, manifest,
+                                 step, last_validation, torch, include_optimizer=False)
+            history.append({"probe": probe_result, "validation": last_validation})
+            write_report(logs / "report.md", history, manifest)
+
         emit({"event": "model_ready", "trainable_parameters": sum(p.numel() for p in policy.parameters() if p.requires_grad),
               "cuda_memory": _cuda_memory(torch), "optimizer": "native_MasterWeightAdamW",
               "validation_mode": manifest["validation_selection"]["mode"]})
+        if args.eval_at_start:
+            evaluate(0)
         for step in range(1, args.steps + 1):
             try:
                 batch = next(iterator)
@@ -363,19 +420,24 @@ def run_training(args, prepared, checkpoints, logs):
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0, error_if_nonfinite=True)
             optimizer.step()
+            samples_seen += len(qpos)
+            valid_elements = int((~batch["is_pad"]).sum().item()) * actions.shape[-1]
+            interval_loss_sum += loss.item() * valid_elements
+            interval_elements += valid_elements
             if step == 1 or step % args.log_every == 0 or step == args.steps:
                 torch.cuda.synchronize()
                 emit({"event": "train", "step": step, "epoch_zero_based": epoch,
                       "normalized_l1": loss.item(), "gradient_norm_before_clip": float(grad_norm.item()),
+                      "window_normalized_l1": interval_loss_sum / interval_elements,
+                      "window_valid_action_elements": interval_elements,
+                      "batch_episode_count": int(batch["episode_index"].unique().numel()),
+                      "samples_seen": samples_seen,
                       "batch_size_actual": len(qpos), "elapsed_seconds": time.monotonic() - started,
                       "cuda_memory": _cuda_memory(torch)})
+                interval_loss_sum = 0.0
+                interval_elements = 0
             if step % args.validate_every == 0 or step == args.steps:
-                last_validation = validate(step)
-                emit({"event": "validation", **last_validation, "cuda_memory": _cuda_memory(torch)})
-                if last_validation["normalized_l1"] < best:
-                    best = last_validation["normalized_l1"]
-                    _save_checkpoint(checkpoints / "best.ckpt", policy, optimizer, statistics, manifest,
-                                     step, last_validation, torch, include_optimizer=False)
+                evaluate(step)
             if step % args.save_every == 0 or step == args.steps:
                 _save_checkpoint(checkpoints / "last.ckpt", policy, optimizer, statistics, manifest,
                                  step, last_validation, torch, include_optimizer=True)
@@ -384,6 +446,12 @@ def run_training(args, prepared, checkpoints, logs):
         torch.cuda.synchronize()
         result = {"status": "TRAINING_STEPS_COMPLETED", "steps": args.steps,
                   "last_validation": last_validation, "best_normalized_val_l1": best,
+                  "best_validation_step": min(history, key=lambda e: e["validation"]["normalized_l1"])["validation"]["step"],
+                  "last_train_probe": history[-1]["probe"], "samples_seen": samples_seen,
+                  "sampler": manifest["sampler_configuration"],
+                  "retained_arrow_cache_peak_mib": getattr(train, "peak_cache_bytes", 0) / 1024 ** 2
+                                                  if args.sampler == "episode_window" else None,
+                  "training_episode_table_reads": getattr(train, "table_reads", None),
                   "cuda_memory": _cuda_memory(torch), "elapsed_seconds": time.monotonic() - started,
                   "task_success_rate_measured": False, "live_deployment_ready": False,
                   "logs": str(logs), "checkpoints": str(checkpoints)}

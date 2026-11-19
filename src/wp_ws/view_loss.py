@@ -63,7 +63,7 @@ def snapshot(source):
 
 
 def loss_rows(records):
-    return [row for row in records if row.get("event") in ("train", "validation")]
+    return [row for row in records if row.get("event") in ("train", "train_probe", "validation")]
 
 
 def state(source, records):
@@ -76,9 +76,11 @@ def state(source, records):
 
 
 def print_row(row):
-    if row.get("event") in ("train", "validation"):
-        label = "train" if row["event"] == "train" else "val"
-        extra = f" samples={row['samples']} mode={row.get('mode', 'unknown')}" if label == "val" else ""
+    if row.get("event") in ("train", "train_probe", "validation"):
+        label = "val" if row["event"] == "validation" else row["event"]
+        extra = f" samples={row['samples']} mode={row.get('mode', 'unknown')}" if label != "train" else ""
+        if "mean_constant_normalized_l1" in row:
+            extra += f" mean_constant={row['mean_constant_normalized_l1']:.6f}"
         print(f"{label:>5}  step={row['step']:>8}  normalized_l1={row['normalized_l1']:.6f}{extra}", flush=True)
 
 
@@ -86,11 +88,15 @@ def print_summary(source, config, records):
     rows = loss_rows(records)
     train = [row for row in rows if row["event"] == "train"]
     val = [row for row in rows if row["event"] == "validation"]
+    probe = [row for row in rows if row["event"] == "train_probe"]
     print(f"Source: {source}\nState: {state(source, records)}", flush=True)
     print(f"Requested steps: {config.get('steps_requested', '?')}; batch: {config.get('batch_size', '?')}; "
           f"validation: {config['validation_mode']}", flush=True)
     if train:
         print(f"Latest train: step={train[-1]['step']} normalized_l1={train[-1]['normalized_l1']:.6f}", flush=True)
+    if probe:
+        print(f"Latest train probe (NOT held out): step={probe[-1]['step']} "
+              f"normalized_l1={probe[-1]['normalized_l1']:.6f}", flush=True)
     if val:
         best = min(val, key=lambda row: row["normalized_l1"])
         print(f"Latest val: step={val[-1]['step']} normalized_l1={val[-1]['normalized_l1']:.6f}; "
@@ -169,12 +175,16 @@ def save_plot(source, task, run_name, config, records):
         figure = Figure(figsize=(10, 5), dpi=140)
         FigureCanvasAgg(figure)
         axes = figure.subplots()
-        for event, label in (("train", "Train (logged batches)"), ("validation", "Validation")):
+        for event, label in (("train", "Train (logged batches)"), ("train_probe", "Fixed TRAIN probe (not held out)"),
+                             ("validation", "Validation")):
             selected = [row for row in rows if row["event"] == event]
             if selected:
                 axes.plot([row["step"] for row in selected], [row["normalized_l1"] for row in selected],
-                          label=label, marker="o" if event == "validation" else None,
+                          label=label, marker="o" if event != "train" else None,
                           markersize=3, linewidth=1.2, alpha=0.85)
+                if event == "validation" and "mean_constant_normalized_l1" in selected[0]:
+                    axes.axhline(selected[0]["mean_constant_normalized_l1"], color="gray", linestyle="--",
+                                 label="Validation mean-action constant", linewidth=1)
         axes.set(xlabel="Training step", ylabel="Normalized action L1 (lower is better)",
                  title=f"{run_name}\nValidation: {config['validation_mode']}")
         axes.grid(alpha=0.25)
