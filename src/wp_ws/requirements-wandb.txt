@@ -1,0 +1,2 @@
+# Optional metrics sidecar only. Does not install/change torch or the training stack.
+wandb==0.21.1

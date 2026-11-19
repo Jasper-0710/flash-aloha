@@ -360,3 +360,85 @@ python -m src.wp_ws.train_act train \
 图像配置、来源指纹、代码指纹和任务别名。**尚未实现面向本套数据/机器人的在线推理适配，
 不能直接交给原有机器人推理入口启动动作。** 后续部署必须在同一共享图像 profile、
 同一相机顺序/动作语义与安全边界内单独验证；本次不改动任何采集、回放、执行、限位或硬件代码。
+
+## 9. W&B 曲线：独立读取指标，不重启训练
+
+`wandb_metrics.py` 是旁路上传器：只读已有 `metrics.jsonl` 和白名单实验配置，
+**不启动训练、不连接机器人、不需要 GPU，也不改写原训练目录**。训练已经开始或
+结束都可以使用，不需要为加 W&B 中断当前训练（训练入口仍未实现断点续训）。
+
+先把本目录的新文件同步到服务器，在当前训练所用的 Python/Conda 环境安装可选依赖：
+
+```bash
+python -m pip install -r src/wp_ws/requirements-wandb.txt
+python -m wandb login
+```
+
+登录密钥只在你自己的终端输入，不写进脚本、训练配置或聊天。
+`online` 会将白名单标量、实验配置和 W&B 自身运行日志发送到你的 W&B 服务，
+使用前确认数据出域规则；默认 `offline` 不上传。
+
+### 9.1 已在运行的正式训练：导入历史并跟随
+
+在**另一个终端**、项目根目录运行；`run-name` 必须与已有训练目录一致：
+
+```bash
+python -m src.wp_ws.wandb_metrics \
+  --run-name act_baseline_gpu1_v1 \
+  --project flash-aloha \
+  --mode online \
+  --follow
+```
+
+需要指定 W&B 账号/团队时，加 `--entity 你的账号或团队`；不填则使用账号默认设置。
+上传器打印 W&B run 页面，在项目 Workspace 中查看：
+
+- `train/normalized_l1`：训练 batch 损失；
+- `val/normalized_l1`：验证损失，summary 记录最小值；
+- `train/gradient_norm_before_clip`：裁剪前梯度范数；
+- `cuda/peak_allocated_gib`、`cuda/peak_reserved_gib`：原训练进程报告的 PyTorch 显存峰值。
+
+这些曲线的横轴均为原训练的 `global_step`，不是上传器的消息计数；同一步的
+train/validation 都会保留。上传器只转发已记录的点，不补造中间 loss；更新频率仍由
+原训练的 `--log-every` / `--validate-every` 决定。需要叠加 train/val 时在同一个
+Line Plot 中选择上述两条 loss，X 轴选 `global_step`；平滑只用于显示，不修改原值。
+验证子集/完整验证模式写入 run config/tags，不把两种指标混为同一评价口径。
+
+`--follow` 从文件开头导入历史，然后等待追加内容；并发写入的半行会等待写完再读。
+训练完成/失败后自动结束跟随。训练若被强杀且没有终态标记，上传器可能继续等待，
+此时可在**上传器终端**按 Ctrl+C；这只停止上传器，**不会停止原训练**。
+
+### 9.2 已结束的 100 步短测：只导入现有曲线
+
+```bash
+python -m src.wp_ws.wandb_metrics \
+  --run-name act_smoke_gpu1_v1 \
+  --project flash-aloha \
+  --mode online
+```
+
+没有 `--follow` 时只导入本次读取到的完整记录；若训练仍在运行，这只是当前快照，
+不表示训练已结束。每次调用创建独立的 W&B run，不恢复/合并此前上传器；重复执行
+会得到多个显示名相同但 ID 不同的 W&B run。
+
+### 9.3 无外网及文件位置
+
+无外网时将上例改为 `--mode offline`；离线记录不会实时出现在网页上。
+以后可用 `wandb sync` 同步脚本输出位置中的 `wandb/offline-run-*` 目录。
+上传器文件只写到：
+
+```text
+LOG_DIR/wp_ws/_wandb_uploads/<task>/<source-run>/upload-*/
+```
+
+`LOG_DIR` 仍来自 `src/config/paths.py`，无额外日志根目录选项；不受 `WANDB_DIR`
+另行改址，SDK 内部缓存/暂存目录也限定在该上传目录下。脚本不调用 `watch()`、
+`save()` 或 artifact 上传，不上传源图像、
+state/action、标准化统计量或 checkpoint；代码/git/console 自动收集与上传器自身
+系统监控均关闭。原训练的 `metrics.jsonl` 仍是指标来源，不依赖 W&B 能否联网。
+
+合成日志测试（不联网、不需要安装 W&B、不训练）：
+
+```bash
+python -m unittest src.wp_ws.tests.test_wandb_metrics -v
+```
