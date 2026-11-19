@@ -1,2 +1,3 @@
 # Optional metrics sidecar only. Does not install/change torch or the training stack.
-wandb==0.21.1
+# 0.22.3 adds support for API keys longer than 40 characters.
+wandb==0.22.3

@@ -370,9 +370,21 @@ python -m src.wp_ws.train_act train \
 先把本目录的新文件同步到服务器，在当前训练所用的 Python/Conda 环境安装可选依赖：
 
 ```bash
-python -m pip install -r src/wp_ws/requirements-wandb.txt
-python -m wandb login
+python -m pip install --upgrade -r src/wp_ws/requirements-wandb.txt
+python -c "import importlib.metadata as m; print('wandb', m.version('wandb'))"
+python -m wandb login --relogin
 ```
+
+可选依赖固定为 `wandb==0.22.3`：这是开始支持超过 40 字符 API Key 的版本。
+若旧环境报 `API key must be 40 characters long, yours was 86`，先执行上面的
+升级命令并确认版本为 `0.22.3`，再重新登录；**不要截断 Key，也不要修改 SDK
+的长度校验**。这个报错不能证明 Key 本身有效，登录时仍需只粘贴完整 Key，
+不要带引号、`export`、变量名或其他文字。前面的 Pydantic
+`UnsupportedFieldAttributeWarning` 不是本次退出的原因，不必为此重装训练环境。
+
+请在能读取原训练日志的机器上运行上传器；本机登录不会替远程服务器登录。
+若训练在服务器，通常直接在服务器的对应 Conda 环境安装、登录并运行上传器，
+无需停止或重启原训练，也不需要重装 PyTorch。
 
 登录密钥只在你自己的终端输入，不写进脚本、训练配置或聊天。
 `online` 会将白名单标量、实验配置和 W&B 自身运行日志发送到你的 W&B 服务，
@@ -442,3 +454,92 @@ state/action、标准化统计量或 checkpoint；代码/git/console 自动收�
 ```bash
 python -m unittest src.wp_ws.tests.test_wandb_metrics -v
 ```
+
+## 10. 本机启动脚本：batch 16 短测和 10 万步 baseline
+
+项目的脚本目录名是 `scripts`；入口为
+`scripts/wp_ws/train_flip_the_pillow_act.sh`。先激活自己的 Conda 环境，再执行：
+
+```bash
+conda activate flash-aloha-act
+
+# 只打印命令；不运行 Python、不下载权重、不访问 GPU、不创建训练目录。
+bash scripts/wp_ws/train_flip_the_pillow_act.sh smoke --dry-run
+
+# 先实测 batch 16：100 步，快速验证子集。
+bash scripts/wp_ws/train_flip_the_pillow_act.sh smoke
+
+# 短测通过后手动启动：100000 步，全量固定验证，每 5000 步验证/保存。
+bash scripts/wp_ws/train_flip_the_pillow_act.sh train
+```
+
+默认保持 240×320、chunk 50、workers 0、ImageNet 初始化和原始夹爪标签。
+审计警告确认参数仍在，所有指纹核验照常执行。不会自动启动短测后的正式训练，
+不会连接机器人，不安装环境，也不会自动启动 W&B。
+
+附加的训练参数覆盖脚本默认值；例如服务器只使用物理 GPU 1，另开一个新实验：
+
+```bash
+GPU_ID=1 bash scripts/wp_ws/train_flip_the_pillow_act.sh train \
+  --run-name act_baseline_gpu1_30k_v2 --steps 30000 --batch-size 4
+```
+
+**这条命令是新训练，不是查看/恢复已有的 30000 步训练。已经在跑的训练不要重复启动。**
+脚本只支持单 GPU；不会因为暴露多个设备就变成 DDP。默认 GPU 为单个
+`CUDA_VISIBLE_DEVICES`（未设置则为 0），也可显式用 `GPU_ID` 选择。
+解释器默认是当前环境的 `python`，可用 `PYTHON_BIN` 指定。已有运行名会拒绝覆盖；
+需要另开实验时用 `--run-name` 改名。当前无断点续训入口。
+
+## 11. 服务器已有训练：不依赖 W&B 看 loss
+
+`src.wp_ws.view_loss` 只读已有训练的 `run_config.json / metrics.jsonl / 终态标记`，
+不导入 torch、W&B 或机器人模块，不重启、不验证数据集、不更改训练参数。
+文字查看仅需 Python 标准库。
+
+先把新工具同步到服务器，在服务器项目根目录执行：
+
+```bash
+# 列出这台机器上的训练名字、请求步数、最近记录步数和结束状态。
+python -m src.wp_ws.view_loss --list
+
+# run-name 必须替换成上一步列出的实际训练名；以下是此前使用过的名字。
+python -m src.wp_ws.view_loss --run-name act_baseline_gpu1_v1 --last 20 --follow
+
+# 不跟随，只查看当前快照并导出 PNG；需可选的 matplotlib。
+python -m src.wp_ws.view_loss --run-name act_baseline_gpu1_v1 --plot
+```
+
+文字查看先显示最近 20 条 train/val loss，以及最近/最佳验证值；`--follow`
+再打印新记录，训练正常完成/失败后自动结束。Ctrl+C 只停查看器，不会停止训练。
+如果没有结束标记，工具不会宣称训练进程仍然存活；需另查原终端/进程。
+尚未写完的末尾一行会明确提示并暂不解析；不会修改/补造任何记录，跟随时等待写完。
+显示精度为 6 位小数，不改变原始指标。
+
+PNG 保存到中央路径：
+
+```text
+LOG_DIR/wp_ws/_loss_views/<task>/<run-name>/loss.png
+```
+
+图只包含实际记录的原始点，不补造中间 loss、不做平滑；横轴为训练 step。
+该文件是**静态快照**，可用 VS Code Remote 等下载到本机打开；重复 `--plot` 更新它。
+若同时用 `--plot --follow`，开始和结束跟随时更新图片，不是实时网页。
+绘图缓存也限定在单独的输出目录，原训练目录、数据和 checkpoint 不变。
+验证图注明原训练的完整验证/冒烟子集模式；查看器不能为正在运行的训练增加验证，
+不能把子集 loss 转换成全量验证，也不把 normalized L1 当作成功率。
+
+工具未同步时，仍可立即用现有服务器代码查看原始日志，不需要重启训练：
+
+```bash
+RUN_NAME=act_baseline_gpu1_v1  # 换成实际训练名
+METRICS="$(python - "$RUN_NAME" <<'PY'
+import sys
+from src.config.paths import LOG_DIR
+print(LOG_DIR / 'wp_ws' / 'flip_the_pillow' / sys.argv[1] / 'metrics.jsonl')
+PY
+)"
+tail -n 20 -f "$METRICS"
+```
+
+这会显示 JSONL 原始记录；Ctrl+C 只结束 `tail`。W&B 网络恢复后，仍可从同一训练日志
+补传曲线，无需重新训练。
