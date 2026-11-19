@@ -181,7 +181,7 @@ python -m src.wp_ws.baseline_data_config
 ```
 
 输出 `CONFIG_PREVIEW_ONLY` **不代表训练就绪或指纹验证通过**。本配置不是项目原生
-训练 YAML，不能直接传给原生训练命令；本工作空间的兼容训练加载器尚未实现。
+训练 YAML，不能直接传给原生训练命令；兼容加载器与离线训练入口见第 8 节。
 项目现有标准加载器会自行随机拆分，不能直接代替已固定的 `split.json`。
 
 初始 baseline 的数据约定已固定为：
@@ -191,8 +191,9 @@ python -m src.wp_ws.baseline_data_config
 - 夹爪标签 `preserve_raw`：不裁剪、不换算、不用 state 替换 action。
 - 显式读取 `audit_v1/split.json`，不按 `train_ratio` 重新划分；标准化只拟合训练集。
 - 使用 `audit_v1/continuity.json`，后续 action chunk 不跨 episode/segment/时间间隔边界。
-- 图像预处理尚未在这里实现；接入加载器时必须复用共享 `standard_image_processing`，
-  并在 checkpoint 保存相同的预处理配置，不能据此声称已具备训练/部署图像一致性。
+- 第 8 节加载器复用共享 `standard_image_processing` 的 Standard ACT/Flow profile，
+  并在 checkpoint 保存相同的预处理配置；尚未实现针对这套数据/机器人的部署适配器，
+  不据此声称端到端部署已经打通。
 - 所有数据、日志和 checkpoint 根目录继续取自 `src/config/paths.py`；不在此配置写绝对路径。
 
 服务器补充检查：`split_ready=True`、`continuity_usable=True`；底盘线速度范围约为
@@ -207,5 +208,155 @@ python -m src.wp_ws.baseline_data_config
 python -m unittest src.wp_ws.tests.test_baseline_data_config -v
 ```
 
-下一步是实现**只读兼容加载器 + 训练集标准化 + 固定验证 + 共享图像处理**，
-再由使用者在服务器上执行短训练，测显存和检查 loss，而不是现在直接跑原生训练入口。
+现在已实现上述离线加载与训练代码。**下一步由使用者运行第 8 节的合成测试、preflight，
+再进行 CUDA 短训练**；不要改用项目原来的随机划分加载器。
+
+## 8. 离线 ACT baseline：从预览走到真实数据短测
+
+### 本次实现范围
+
+| 文件 | 职责 |
+|---|---|
+| `verified_data.py` | 核验完成标记、源文件 SHA-256、split 完整/不重叠、真实连续区间 |
+| `act_dataset.py` | 直接读取原始 Parquet；训练集统计；边界 padding/mask；共享图像处理 |
+| `train_act.py` | `preflight` 与原生 ACT CUDA/bf16 短训练，固定验证、日志和 checkpoint |
+| `tests/test_act_baseline.py` | 合成数据的指纹/划分/连续性/标签/图像/只读性测试 |
+
+**不需要转存 HDF5/Zarr、不修改任务标签、不重新导出图片、不改原始夹爪值。**
+这是仓库的 **decoder-only ACT**，不是另装 LeRobot 的 VAE-ACT。直接复用
+`src/policy/act.py` 及其 `MasterWeightAdamW`：模型/梯度 bf16，FP32 主权重与 AdamW
+状态；不另造优化器、不启用 RTC、compile、随机图像增强或新的图像 profile。
+
+默认三路相机顺序为 `cam_high / cam_left_wrist / cam_right_wrist`，原始 RGB bytes
+逐行解码，通过共享 Standard ACT/Flow profile 的 INTER_AREA resize 转为
+`3×3×240×320`、float32 `[0,1]`；ImageNet 标准化仍在原生 ACT 内部完成。
+不裁剪、无 letterbox、无灰度。`--height/--width` 是明确的训练配置，会写进 checkpoint，
+不能在部署时任意改大小。原始 480×640 图像不被覆盖。
+
+训练时每个 epoch 先 shuffle episode，再 shuffle 该 episode 的行，并在 episode 内
+组 batch，避免随机跨文件导致反复读取大 Parquet。每行每 epoch 采样一次，不丢尾部 batch。
+每个加载进程最多缓存一个 Arrow episode（保存的压缩图片字节，不是全量解码图像）；
+实际 RAM 占用仍取决于单个 episode 大小、worker 数与预取，初次请用 `--workers 0`。
+默认 chunk 为 50 个保存动作，50 Hz 下为 **1 秒名义时间**，不是相机曝光同步证明。
+接近 episode/segment/elapsed-gap 边界时保留当前行，用零填充**标准化后的 padding**，
+并在 loss 中完全 mask；不跨边界补动作，也不丢弃尾部短 chunk。
+
+### 8.1 环境依赖（仅缺包时补装）
+
+在服务器已安装的 `(flash-aloha)` Conda 环境内运行。先检查，不要无条件覆盖现有 CUDA 栈：
+
+```bash
+python - <<'PY'
+import torch, torchvision, cv2, pyarrow
+print('torch:', torch.__version__, 'torchvision:', torchvision.__version__)
+print('opencv:', cv2.__version__, 'pyarrow:', pyarrow.__version__)
+print('cuda:', torch.cuda.is_available())
+print('bf16:', torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False)
+PY
+```
+
+离线 audit 的 requirements 不含训练依赖。需要新装时可使用
+`python -m pip install -r src/wp_ws/requirements-act.txt`；其中 torch/torchvision 与项目
+`pyproject.toml` 的固定版本一致，但 GPU 驱动、CUDA wheel 来源应按服务器情况选择，
+不要为了这一步安装机器人驱动、ROS 或整个 LeRobot 依赖栈。原生 ACT 只接受 bf16；
+不支持时会明确报错，不静默降到 fp16。preflight 本身不需要 torch/CUDA。
+
+### 8.2 先跑合成测试，再核验真实数据（使用者执行）
+
+```bash
+cd /data1/wp_ws/flash-aloha
+conda activate flash-aloha
+
+# 仅 TemporaryDirectory 合成 Parquet；不接触真实演示、不训练。
+python -m unittest discover -s src/wp_ws/tests -v
+
+# 实际读取服务器数据，但不改写、不训练、不连接机器人。
+python -m src.wp_ws.train_act preflight \
+  --run-name act_preflight_v1 \
+  --batch-size 4 --chunk-size 50 --height 240 --width 320
+```
+
+preflight 会：
+
+1. 读取 `COMPLETED.json / report.json / fingerprints.json / split.json / continuity.json`。
+2. **重新计算当前源文件 SHA-256**，与 `audit_v1` 比较；不重新全量解码 155802 张图片。
+   有逐文件进度；大文件 hash 需要时间，不能用路径/文件存在代替内容验证。
+3. 从保存的 elapsed_time 与 segment 验证区间，检查固定划分覆盖所有 episode、无重叠。
+4. 仅遍历训练集 state/action 列，以 float64 合并总体矩计算 mean/std；std 下限 `0.01`
+   用来稳定常量维度。**这不是裁剪动作**；state/action 各自统计，验证集完全不参与。
+5. 解码训练/验证 CPU batch，检查形状/有限值，输出 `PREFLIGHT_PASSED`。
+
+默认日志：`logs/wp_ws/flip_the_pillow/act_preflight_v1/`。其中包含：
+`preflight.json`（batch 形状/原始夹爪反标准化范围）、`normalization_stats.json`、
+`run_config.json`、原审计划分/连续性/指纹快照，最后写 `COMPLETED.json`。
+预览 `CONFIG_PREVIEW_ONLY` 与这里的内容指纹核验是不同阶段。
+**PREFLIGHT_PASSED 不代表 CUDA 已能训练，更不代表机器人动作安全或任务成功。**
+
+### 8.3 100 步短训练：实测显存（使用者执行）
+
+审阅原有警告后再运行。`--acknowledge-audit-warnings` 表示知悉警告，不删除或忽略
+指纹/连续性错误，也不把旧采集数据伪装成符合原生时序契约。`BASE_MOTION_PRESENT`
+仍需结合视频/录制过程确认；此训练不预测或控制底盘。
+
+```bash
+python -m src.wp_ws.train_act train \
+  --run-name act_smoke_v1 \
+  --steps 100 --batch-size 4 --chunk-size 50 \
+  --height 240 --width 320 --workers 0 \
+  --validate-every 50 --val-max-batches 10 \
+  --acknowledge-audit-warnings
+```
+
+- 默认用 ImageNet `IMAGENET1K_V1` 初始化 ResNet18；torchvision 可能尝试联网下载，缓存
+  由中央路径配置到 `CKPT_DIR/wp_ws/_torchvision_cache`。若网络不通，准备同一版本权重缓存，
+  不会静默转为随机权重。仅做计算连通性测试时可**显式**选择 `--backbone-init scratch`，
+  但它不是相同的 pretrained baseline，不要混淆实验结果。
+- train 每次启动仍重新验证源 SHA-256、重新拟合训练统计：不盲信旧 preflight，不能在两次
+  命令之间改数据或审计文件。固定训练/验证仍为原 91/10 episodes，不用 train_ratio。
+- 默认 `val-max-batches=10` 只评估固定验证集上**均匀间隔的最多 40 个起始行**，覆盖整个
+  验证序列范围，而不是随机抽样。样本索引写入 run_config；这是快速 smoke 指标，
+  **不是 5823 行全量验证**。loss 为有效动作元素加权的 normalized L1，不是成功率。
+- `metrics.jsonl` 与终端会输出 `peak_allocated_gib`、`peak_reserved_gib`，包括模型、
+  FP32 master weights、优化器状态、反向传播和验证阶段。它们是本进程 PyTorch 峰值，
+  不是整卡所有进程/驱动的总显存；应另外留余量，并结合 `nvidia-smi` 查看整卡占用。
+- 当前没有服务器实测值，不把推测显存当作结果。如果 OOM，把 batch 降为 2，再使用新名字
+  （如 `act_smoke_b2_v1`）；不要改原始数据或绕开 bf16 要求。
+
+默认产物：
+
+```text
+logs/wp_ws/flip_the_pillow/act_smoke_v1/
+  preflight.json / normalization_stats.json / run_config.json
+  split.json / continuity.json / fingerprints.json
+  metrics.jsonl / COMPLETED.json
+ckpts/wp_ws/flip_the_pillow/act_smoke_v1/
+  run_config.json / normalization_stats.json
+  best.ckpt / last.ckpt
+```
+
+两个根目录都只来自 `src/config/paths.py`。已有 run 不覆盖；省略 `--run-name` 可自动
+生成 UTC 时间名。失败/中断日志写 `FAILED.json`，不会写训练完成标记。
+
+### 8.4 短测通过后才开正式 baseline
+
+依据实测显存确定 batch，确认短测 loss 有限且无加载/指纹错误后，再使用**新 run**。
+以下仅为起始方案，不表示 30000 步足够学会任务：
+
+```bash
+python -m src.wp_ws.train_act train \
+  --run-name act_baseline_v1 \
+  --steps 30000 --batch-size 4 --chunk-size 50 \
+  --height 240 --width 320 --workers 0 \
+  --validate-every 2000 --val-max-batches 0 --save-every 2000 \
+  --acknowledge-audit-warnings
+```
+
+`--val-max-batches 0` 才是所有固定验证起始行，padding 元素仍不算 loss。全量验证也不
+用验证数据拟合统计。`best.ckpt` 按该 run 的固定验证 normalized L1 选取；
+`last.ckpt` 另保存优化器/部分 RNG 状态供后续开发使用，**当前尚未实现 resume 入口**，
+不要以为中断后直接重复命令就能续训（已有目录会拒绝覆盖）。
+
+这些 checkpoint 明确标记 `live_deployment_ready=false`，保存了原始标签语义、标准化、
+图像配置、来源指纹、代码指纹和任务别名。**尚未实现面向本套数据/机器人的在线推理适配，
+不能直接交给原有机器人推理入口启动动作。** 后续部署必须在同一共享图像 profile、
+同一相机顺序/动作语义与安全边界内单独验证；本次不改动任何采集、回放、执行、限位或硬件代码。

@@ -1,0 +1,6 @@
+# Offline wp_ws native ACT only; no ROS, LeRobot or robot-driver installation.
+# Use an existing matching torch/torchvision CUDA installation when present.
+-r requirements.txt
+opencv-python>=4.11.0.86
+torch==2.7.1
+torchvision==0.22.1
