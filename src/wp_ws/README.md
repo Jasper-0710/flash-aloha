@@ -149,3 +149,63 @@ Flash ALOHA 原生采集契约。
 再准备显式消费 **split.json + continuity.json** 的离线 ACT 加载器、仅训练集标准化和
 服务器短测。届时图像确定性处理必须复用 `src/contracts/standard_image_processing.py`；
 本工具只检查原始图片，没有另建训练/推理预处理实现。
+
+## 7. 当前决定：不改源任务名，训练侧配置翻转枕头
+
+**不运行改名脚本、不改源元数据、不改旧报告。** 源 `task` 保留 `pick_cup`，
+训练实验名用 `flip_the_pillow`，中文描述为“翻转枕头”。只要数据及体检文件没有变化，
+继续使用 `audit_v1`；不需要因为这个训练别名重新体检。
+
+数据配置：`src/wp_ws/flip_the_pillow_baseline.json`，由
+`src/wp_ws/baseline_data_config.py` 解析。两个字段有意分开：
+
+```json
+{
+  "task_name": "flip_the_pillow",
+  "task_description": "翻转枕头",
+  "source_task_name": "pick_cup",
+  "dataset": "flip_the_pillow",
+  "audit_run": "audit_v1"
+}
+```
+
+以上只是完整配置的关键字段，不要用这个片段覆盖完整文件。`task_name` 是实验/
+checkpoint 命名，不覆盖读取到的 `task_index` 或源标签，不作为额外的动作转换。
+后续加载器须核对 `source_task_name`，并在训练产物中保留源标签、训练别名和源指纹。
+当前的 `TASK_LABEL_MISMATCH` 警告如实保留，不删除、不伪装成已经改名。
+
+配置预览（不需要 GPU/第三方依赖，不读取演示或体检内容，也不创建目录）：
+
+```bash
+python -m src.wp_ws.baseline_data_config
+```
+
+输出 `CONFIG_PREVIEW_ONLY` **不代表训练就绪或指纹验证通过**。本配置不是项目原生
+训练 YAML，不能直接传给原生训练命令；本工作空间的兼容训练加载器尚未实现。
+项目现有标准加载器会自行随机拆分，不能直接代替已固定的 `split.json`。
+
+初始 baseline 的数据约定已固定为：
+
+- 输入 `observation.state` 为原始 14 维；监督 `action` 为原始 14 维。
+- `use_base_action=false`：不把测得的底盘速度拼入 state/action，不补零、不修改源列。
+- 夹爪标签 `preserve_raw`：不裁剪、不换算、不用 state 替换 action。
+- 显式读取 `audit_v1/split.json`，不按 `train_ratio` 重新划分；标准化只拟合训练集。
+- 使用 `audit_v1/continuity.json`，后续 action chunk 不跨 episode/segment/时间间隔边界。
+- 图像预处理尚未在这里实现；接入加载器时必须复用共享 `standard_image_processing`，
+  并在 checkpoint 保存相同的预处理配置，不能据此声称已具备训练/部署图像一致性。
+- 所有数据、日志和 checkpoint 根目录继续取自 `src/config/paths.py`；不在此配置写绝对路径。
+
+服务器补充检查：`split_ready=True`、`continuity_usable=True`；底盘线速度范围约为
+`[-0.001, 0] m/s`，角速度约为 `[-0.004, 0.002] rad/s`。这些极值很小，
+但不能仅凭极值判断是测量噪声，也不能证明底盘完全静止或累计位移可忽略。
+`BASE_MOTION_PRESENT` 继续保留；应结合录制过程/视频确认底盘没有参与完成任务。
+不因这些数值擅自裁剪、删帧、重录或更改数据。
+
+可由使用者手动运行配置合成测试：
+
+```bash
+python -m unittest src.wp_ws.tests.test_baseline_data_config -v
+```
+
+下一步是实现**只读兼容加载器 + 训练集标准化 + 固定验证 + 共享图像处理**，
+再由使用者在服务器上执行短训练，测显存和检查 loss，而不是现在直接跑原生训练入口。

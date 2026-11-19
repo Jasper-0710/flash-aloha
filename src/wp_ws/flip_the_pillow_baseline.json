@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "policy": "ACT",
+  "task_name": "flip_the_pillow",
+  "task_description": "翻转枕头",
+  "dataset": "flip_the_pillow",
+  "source_task_name": "pick_cup",
+  "audit_run": "audit_v1",
+  "state_key": "observation.state",
+  "state_dim": 14,
+  "action_key": "action",
+  "action_dim": 14,
+  "use_base_action": false,
+  "gripper_labels": "preserve_raw",
+  "statistics_scope": "train_episode_indices_only",
+  "split_source": "audit_split_json",
+  "continuity_source": "audit_continuity_json"
+}
