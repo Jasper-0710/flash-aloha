@@ -814,3 +814,112 @@ LOG_DIR/wp_ws/flip_the_pillow/act_mix8_b16_10k_v1/
 python -m unittest discover -s src/wp_ws/tests -v
 bash -n scripts/wp_ws/compare_sampling_flip_the_pillow_act.sh
 ```
+
+## 14. 完整验证集离线评估：动作维度、预测距离、逐 episode 对比
+
+完成 `act_mix8_b16_10k_v1` 后，下一步先看 **best checkpoint 的完整固定验证集误差和动作曲线**，
+不直接增加 step/batch 或上机器人。此工具不训练、不下载模型、不写原数据/训练日志/checkpoint，
+也不重算统计、不重新划分数据、不变更 action 对齐、夹爪、图像或 chunk masking。
+
+### 用户执行
+
+```bash
+conda activate flash-aloha-act
+cd /home/ubuntu/Desktop/code/VLA/flash-aloha
+
+# 可先确认命令：不启动 Python，不访问 CUDA、不生成文件
+bash scripts/wp_ws/evaluate_flip_the_pillow_act.sh evaluate --dry-run
+
+# CPU 预检：读 checkpoint/核对指纹/解码一个验证 batch，不做模型推理
+bash scripts/wp_ws/evaluate_flip_the_pillow_act.sh preflight
+
+# 预检通过后：单卡离线评估，自动再次核对；默认 batch 与原验证一致（这轮为 16）
+GPU_ID=0 bash scripts/wp_ws/evaluate_flip_the_pillow_act.sh evaluate
+```
+
+默认来源：`CKPT_DIR/wp_ws/flip_the_pillow/act_mix8_b16_10k_v1/best.ckpt`；
+同时要求同名的训练日志及其 `COMPLETED.json`。这不是部署入口，不接受任意外部 checkpoint。
+使用 restricted `torch.load(weights_only=True, map_location="cpu")`，失败时不退回不受限 pickle。
+CPU 预检验证文件内容/声明和数据适配器；**原生模型参数形状的严格加载及 GPU 推理仍在 evaluate 阶段完成**。
+只加载本项目自己产生、来源可信的模型，文件哈希证明一致性而不是外部真实性。
+
+默认 CPU 预检输出名为 `act_mix8_eval_preflight_v1`，正式评估输出名为 `act_mix8_eval_v1`。
+已存在就拒绝覆盖；重试指定新名字，例如 `--run-name act_mix8_eval_v2`。
+可用 `--source-run OTHER_RUN --checkpoint best` 指向另一轮**已完整完成且用完整固定验证集**的 baseline；
+`--checkpoint last` 要求其 step 和最后验证记录完全一致。中断、正在训练、smoke subset、
+`act_overfit` 格式和 RTC checkpoint 不会被这个入口当作可比较的结果。
+
+服务器：同步本次代码，进入 `/data1/wp_ws/flash-aloha`，激活 `flash-aloha`，使用 `GPU_ID=1`（或另一张获准单卡）。
+来源 run 必须在**执行机器**对应的中央日志/ckpt 路径下；本机存在不代表服务器上有。
+不要为了凑齐目录伪造 `COMPLETED.json` 或 audit。这里不支持六卡 DDP。
+原数据、audit、训练记录及其指纹须相互匹配；若跨机器搬运，应保留对应产物，不能悄悄改统计或配对。
+
+等价模块命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m src.wp_ws.evaluate_act evaluate \
+  --source-run act_mix8_b16_10k_v1 --checkpoint best \
+  --run-name act_mix8_eval_v1 --examples-per-episode 2
+```
+
+没有图像尺寸、chunk、action shift、统计或验证划分覆盖选项：它们全部来自原 checkpoint/固定 audit。
+可显式改 `--batch-size`，但会记录与原验证的差异；**首轮先不改**。
+不会调用 ImageNet 权重下载、优化器或反向传播。
+
+### 做哪些检查
+
+1. 核对 checkpoint 与日志/ckpt 目录的配置、标准化文件、完成记录、保存 step。
+2. 重验源数据 SHA-256/audit 指纹，确认原来的验证 episode、continuity 和 provenance 未变；
+   不用验证数据拟合任何统计量。相关推理实现和共享图像处理发生改变时拒绝静默迁移。
+3. 复用 `ActDataset` 和原 `EpisodeBatchSampler(shuffle=False)`；每个验证起点恰好一次，
+   使用原图像处理和动作 padding，首个目标仍是同一保存行的 action，绝不读取未来动作来辅助预测。
+4. `eval()` + `inference_mode()` 逐 episode 推理；模型 L1 和训练均值常数 L1 都按有效 action 元素累计，
+   不做 batch 均值的无权重平均。指标有总体、逐 episode、逐维度、逐 horizon 四种视角。
+5. 与 checkpoint 保存的验证 L1 复现对照：数量/目标基线不一致直接失败；
+   模型 L1 偏差超过 `0.0005 + 0.005 × 原 L1` 标为 `REPRODUCTION_WARNING`，先核对环境/批大小，
+   不自动解释为性能变化。**此容差不是任务成功或硬件安全阈值**。
+6. 结束前再次检查输入未变；所有产物成功后才写新输出目录的 `COMPLETED.json`。
+   失败只留下新目录里的 `FAILED.json` 和部分诊断，不能把部分 PNG 当作完整评估。
+
+### 输出和如何看
+
+```text
+LOG_DIR/wp_ws/flip_the_pillow/act_mix8_eval_v1/
+  run_config.json               来源 checkpoint SHA-256、代码/预处理/数据证据、评估配置
+  preflight.json                CPU 预检，不是 GPU/动作成功证明
+  examples.json                 看结果前选定的每条 episode 的等分中点（默认 25%、75%）
+  metrics.json                  总体、逐维、逐 horizon、逐 episode、复现结果
+  report.md                     中文摘要和单位说明
+  predictions/episode_XXXXXX.npz 全部标准化预测/目标、padding、frame index、train mean/std、连续区间
+  plots/horizon_errors.png      offset 0…H−1：L1、关节度数、夹爪原单位误差和有效数
+  plots/episode_errors.png      每条验证 episode 与训练均值常数比较
+  plots/t0_episode_XXXXXX.png    每个真实观测重新预测的第 0 个动作，不是 rollout
+  plots/chunk_episode_…_frame_….png  单个固定观测预测的完整有效 chunk
+  COMPLETED.json / FAILED.json  评估程序状态，不是翻转枕头成功/失败
+```
+
+- **先看复现**：本轮原验证 L1 是约 `0.397504`，均值常数约 `0.842791`。
+  这是原训练记录，**不是本工具已经测出的新结果**。不能拿 `train_probe` 的误差冒充验证指标。
+- **再看泛化分布**：是不是所有验证 episode 都优于简单常数，还是少数样本拖累？
+  常数是很弱的参照，优于它不证明学会了视觉或接触控制。
+- **再看动作时序**：关节接近、翻转和夹爪开合的位置/时刻是否跟上目标，是否预测成平滑均值、
+  转折错位或单侧偏差。不要只看全维度平均 loss。
+- **看预测距离时同时看有效数**：后段 chunk 有 padding，有效样本不相同；
+  同一动作也会出现在多个重叠 chunk，不是去重后的单帧评价。
+- 图按 checkpoint 统计量反标准化，关节单位 rad，报告另给 degree；夹爪保留原归一化单位，
+  **不裁剪 `[0,1]`、不改成电机角度**。反标准化存在 float32 舍入。
+- 横轴是已保存 frame index/预测 offset，不按 FPS 伪造相机时间戳；不跨 continuity 边界连轨迹线。
+- `.npz` 用 `np.load(path, allow_pickle=False)` 读取，不包含图片或 Python 对象。该工具不自动上传 W&B。
+
+**验证集已参与 best checkpoint 选择，不是新的独立测试集；离线预测仍以真实录制状态和图像为输入，
+不能证明闭环稳定性、视觉依赖、采集曝光同步、控制时延或真机任务成功率。**
+先回传新 `report.md`；必要时再结合逐 episode/夹爪曲线决定延长训练、收集数据或设计下一项离线对照。
+不要仅靠进一步压低这份验证 loss 就认定可部署。
+
+合成 CPU 测试（不会读真实录制数据或启动 GPU/机器人）：
+
+```bash
+python -m unittest src.wp_ws.tests.test_evaluate_act src.wp_ws.tests.test_evaluation_launcher -v
+python -m unittest discover -s src/wp_ws/tests -v
+bash -n scripts/wp_ws/evaluate_flip_the_pillow_act.sh
+```
